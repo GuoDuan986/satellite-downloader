@@ -1,0 +1,140 @@
+{
+  "type": "FeatureCollection",
+  "links": [
+    {
+      "rel": "root",
+      "type": "application/json",
+      "href": "https://planetarycomputer.microsoft.com/api/stac/v1/"
+    },
+    {
+      "rel": "self",
+      "type": "application/geo+json",
+      "href": "https://planetarycomputer.microsoft.com/api/stac/v1/search"
+    }
+  ],
+  "features": [
+    {
+      "id": "LC09_L2SP_FAKE_001",
+      "bbox": [100.0, 20.0, 110.0, 30.0],
+      "type": "Feature",
+      "links": [
+        {
+          "rel": "collection",
+          "type": "application/json",
+          "href": "https://planetarycomputer.microsoft.com/api/stac/v1/collections/landsat-c2-l2"
+        },
+        {
+          "rel": "self",
+          "type": "application/geo+json",
+          "href": "https://planetarycomputer.microsoft.com/api/stac/v1/collections/landsat-c2-l2/items/LC09_L2SP_FAKE_001"
+        }
+      ],
+      "assets": {
+        "red": {
+          "href": "https://fake-storage.blob.core.windows.net/fake/red.tif",
+          "type": "image/tiff; application=geotiff; profile=cloud-optimized",
+          "roles": ["data", "reflectance"],
+          "title": "Red Band",
+          "raster:bands": [
+            {
+              "scale": 0.0000275,
+              "nodata": 0,
+              "offset": -0.2,
+              "data_type": "uint16",
+              "spatial_resolution": 30
+            }
+          ]
+        },
+        "green": {
+          "href": "https://fake-storage.blob.core.windows.net/fake/green.tif",
+          "type": "image/tiff; application=geotiff; profile=cloud-optimized",
+          "roles": ["data", "reflectance"],
+          "title": "Green Band",
+          "raster:bands": [
+            {
+              "scale": 0.0000275,
+              "nodata": 0,
+              "offset": -0.2,
+              "data_type": "uint16",
+              "spatial_resolution": 30
+            }
+          ]
+        },
+        "blue": {
+          "href": "https://fake-storage.blob.core.windows.net/fake/blue.tif",
+          "type": "image/tiff; application=geotiff; profile=cloud-optimized",
+          "roles": ["data", "reflectance"],
+          "title": "Blue Band",
+          "raster:bands": [
+            {
+              "scale": 0.0000275,
+              "nodata": 0,
+              "offset": -0.2,
+              "data_type": "uint16",
+              "spatial_resolution": 30
+            }
+          ]
+        },
+        "qa_pixel": {
+          "href": "https://fake-storage.blob.core.windows.net/fake/qa_pixel.tif",
+          "type": "image/tiff; application=geotiff; profile=cloud-optimized",
+          "roles": ["cloud", "cloud-shadow", "snow-ice", "water-mask"],
+          "title": "Pixel Quality Assessment Band",
+          "raster:bands": [
+            {
+              "unit": "bit index",
+              "nodata": 1,
+              "data_type": "uint16",
+              "spatial_resolution": 30
+            }
+          ]
+        }
+      },
+      "geometry": {
+        "type": "Polygon",
+        "coordinates": [
+          [
+            [100.0, 20.0],
+            [110.0, 20.0],
+            [110.0, 30.0],
+            [100.0, 30.0],
+            [100.0, 20.0]
+          ]
+        ]
+      },
+      "collection": "landsat-c2-l2",
+      "properties": {
+        "gsd": 30,
+        "datetime": "2026-07-13T23:51:54.410257Z",
+        "platform": "landsat-9",
+        "proj:epsg": 32615,
+        "proj:shape": [8391, 8421],
+        "description": "Landsat Collection 2 Level-2",
+        "instruments": ["oli", "tirs"],
+        "eo:cloud_cover": 100.0,
+        "proj:transform": [30.0, 0.0, 331185.0, 0.0, -30.0, 9157215.0],
+        "view:off_nadir": 0,
+        "landsat:wrs_row": 244,
+        "landsat:wrs_path": 80,
+        "landsat:wrs_type": 2,
+        "view:sun_azimuth": 264.54492039,
+        "landsat:correction": "L2SP",
+        "view:sun_elevation": 22.79537907,
+        "landsat:cloud_cover_land": 100.0,
+        "landsat:collection_number": "02",
+        "landsat:collection_category": "T2"
+      },
+      "stac_extensions": [
+        "https://stac-extensions.github.io/raster/v1.1.0/schema.json",
+        "https://stac-extensions.github.io/eo/v1.1.0/schema.json",
+        "https://stac-extensions.github.io/view/v1.0.0/schema.json",
+        "https://stac-extensions.github.io/projection/v1.1.0/schema.json",
+        "https://landsat.usgs.gov/stac/landsat-extension/v1.1.1/schema.json",
+        "https://stac-extensions.github.io/classification/v1.0.0/schema.json",
+        "https://stac-extensions.github.io/scientific/v1.0.0/schema.json"
+      ],
+      "stac_version": "1.0.0"
+    }
+  ],
+  "numberReturned": 1
+}

@@ -1,6 +1,7 @@
 # src/satellite_downloader/datasets/sentinel1/provider.py
 from __future__ import annotations
-from datetime import datetime
+import logging
+from datetime import datetime, date
 from typing import List, Optional, Mapping
 from shapely.geometry import box, Polygon
 
@@ -8,42 +9,37 @@ from satellite_downloader.core.contracts import SatelliteProvider, SearchRequest
 from satellite_downloader.shared.cdse import CDSEClient
 from satellite_downloader.datasets.sentinel1.options import Sentinel1SearchOptions
 
+logger = logging.getLogger(__name__)
+
 
 class Sentinel1Provider(SatelliteProvider):
-    """Sentinel-1 IW GRD 数据提供者"""
+    """Sentinel-1 IW GRD 数据提供者 (CDSE OData)"""
 
-    # 固定 AOI（从项目配置读取）
-    AOI_BOUNDS = (104.74993, 23.891659, 106.670617, 25.28654)
+    # 默认固定 AOI（当 request 未显式传入空间范围时使用）
+    DEFAULT_AOI_BOUNDS = (104.74993, 23.891659, 106.670617, 25.28654)
 
     def __init__(self, cdse_client: Optional[CDSEClient] = None):
         self.cdse_client = cdse_client
 
     def search(self, request: SearchRequest) -> List[SatelliteProduct]:
-        """
-        搜索 Sentinel-1 IW GRD 产品。
-        """
-        # 1. 解析专属参数
+        """搜索 Sentinel-1 IW GRD 产品"""
         s1_options = self._parse_options(request.options)
-
-        # 2. 构建 OData 查询 URL
         query_url = self._build_odata_query(request, s1_options)
 
-        # 3. 执行查询
         if self.cdse_client is None:
-            raise RuntimeError("CDSE 客户端未初始化，请先设置 cdse_client")
+            raise RuntimeError("CDSE 客户端未初始化，请先在 Worker 中注入或登录 cdse_client")
 
         response = self.cdse_client.get(query_url)
         data = response.json()
 
-        # 4. 解析响应，构建 SatelliteProduct 列表
         products = []
         for item in data.get("value", []):
             product = self._parse_item(item)
             if product:
                 products.append(product)
 
-        # 5. 本地足迹精确相交过滤 + 去重
-        return self._filter_and_deduplicate(products)
+        # 本地足迹精确相交过滤 + 去重
+        return self._filter_and_deduplicate(products, request)
 
     def _parse_options(self, options: Mapping[str, object]) -> Sentinel1SearchOptions:
         """从 SearchRequest.options 解析 Sentinel-1 专属参数"""
@@ -52,12 +48,21 @@ class Sentinel1Provider(SatelliteProvider):
             orbit_direction=options.get("orbit_direction"),
         )
 
+    def _get_request_bounds(self, request: SearchRequest) -> tuple[float, float, float, float]:
+        """解析检索请求中的空间范围，若无则退回默认 AOI"""
+        if hasattr(request, "bbox") and request.bbox:
+            return request.bbox
+        elif hasattr(request, "aoi") and request.aoi:
+            return request.aoi.bounds
+        return self.DEFAULT_AOI_BOUNDS
+
     def _build_odata_query(
             self,
             request: SearchRequest,
             s1_options: Sentinel1SearchOptions
     ) -> str:
-        xmin, ymin, xmax, ymax = self.AOI_BOUNDS
+        # ✅ 动态提取空间范围
+        xmin, ymin, xmax, ymax = self._get_request_bounds(request)
         wkt_polygon = f"POLYGON(({xmin} {ymin}, {xmax} {ymin}, {xmax} {ymax}, {xmin} {ymax}, {xmin} {ymin}))"
 
         filters = [
@@ -71,16 +76,15 @@ class Sentinel1Provider(SatelliteProvider):
         if s1_options.orbit_direction:
             filters.append(f"orbitDirection eq '{s1_options.orbit_direction}'")
 
-        filters.append(
-            f"ContentDate/Start ge {request.start_date.isoformat()}T00:00:00.000Z"
-        )
-        filters.append(
-            f"ContentDate/Start le {request.end_date.isoformat()}T23:59:59.999Z"
-        )
+        # 安全格式化日期
+        start_str = request.start_date.strftime("%Y-%m-%d") if isinstance(request.start_date, (date, datetime)) else str(request.start_date)
+        end_str = request.end_date.strftime("%Y-%m-%d") if isinstance(request.end_date, (date, datetime)) else str(request.end_date)
+
+        filters.append(f"ContentDate/Start ge {start_str}T00:00:00.000Z")
+        filters.append(f"ContentDate/Start le {end_str}T23:59:59.999Z")
 
         base_url = "https://catalogue.dataspace.copernicus.eu/odata/v1/Products"
         filter_str = " and ".join(filters)
-        # ✅ 关键修复：添加 $expand=Attributes
         return f"{base_url}?$filter={filter_str}&$top={request.max_results}&$orderby=ContentDate/Start desc&$expand=Attributes"
 
     def _parse_item(self, item: dict) -> Optional[SatelliteProduct]:
@@ -90,31 +94,21 @@ class Sentinel1Provider(SatelliteProvider):
 
         parts = name.split("_")
 
-        # 从文件名提取基础元数据
         platform = parts[0] if len(parts) > 0 else "Unknown"
         mode = parts[1] if len(parts) > 1 else "IW"
         product_type = parts[2] if len(parts) > 2 else "GRDH"
         processing_level = parts[3] if len(parts) > 3 else ""
 
-        # 极化方式：从处理级别中提取（如 1SDV → DV → VV+VH）
+        # 默认从文件名解析极化
         polarisation = ""
         if processing_level.startswith("1S"):
             pol_code = processing_level[2:]
-            if pol_code == "DV":
-                polarisation = "VV+VH"
-            elif pol_code == "DH":
-                polarisation = "HH+HV"
-            elif pol_code == "SV":
-                polarisation = "VV"
-            elif pol_code == "SH":
-                polarisation = "HH"
-            else:
-                polarisation = pol_code
+            pol_map = {"DV": "VV+VH", "DH": "HH+HV", "SV": "VV", "SH": "HH"}
+            polarisation = pol_map.get(pol_code, pol_code)
 
-        # 相对轨道号：从文件名第7段提取
         relative_orbit = parts[6] if len(parts) > 6 else None
 
-        # ========== ✅ 关键修复：从 Attributes 数组中提取轨道方向 ==========
+        # 从 Attributes 数组提取元数据
         attributes_list = item.get("Attributes", [])
         attr_dict = {}
         if isinstance(attributes_list, list):
@@ -122,28 +116,23 @@ class Sentinel1Provider(SatelliteProvider):
                 if isinstance(attr, dict) and "Name" in attr and "Value" in attr:
                     attr_dict[attr["Name"]] = attr["Value"]
 
-        # 优先从 Attributes 获取，如果没有则回退到根节点（兼容性）
         orbit_direction = (
                 attr_dict.get("orbitDirection") or
                 item.get("orbitDirection") or
                 ""
         )
 
-        # 如果 Attributes 中有 polarizationChannels，优先使用（比从文件名解析更准确）
         if "polarizationChannels" in attr_dict:
             pol_channels = attr_dict.get("polarizationChannels", "")
-            # 例如 "VV,VH" -> "VV+VH"
             if pol_channels and "," in pol_channels:
                 polarisation = pol_channels.replace(",", "+")
             elif pol_channels:
                 polarisation = pol_channels
-        # ================================================================
 
-        # 几何足迹
         geometry_json = item.get("Geometry", {})
         footprint = self._parse_footprint(geometry_json)
 
-        # 资产（整包 ZIP）
+        # 构造整包 ZIP 资产
         assets = []
         online = item.get("Online", False)
         if online:
@@ -162,7 +151,6 @@ class Sentinel1Provider(SatelliteProvider):
                     roles=("data", "archive"),
                 ))
 
-        # 成像时间
         content_date = item.get("ContentDate", {})
         sensing_time_str = content_date.get("Start", "")
         if sensing_time_str:
@@ -172,7 +160,7 @@ class Sentinel1Provider(SatelliteProvider):
 
         return SatelliteProduct(
             provider_id="sentinel1",
-            product_id=item.get("Id", ""),
+            product_id=str(item.get("Id", "")),
             name=name,
             sensing_time=sensing_time,
             footprint=footprint,
@@ -185,27 +173,30 @@ class Sentinel1Provider(SatelliteProvider):
                 "mode": mode,
                 "product_type": product_type,
                 "polarisation": polarisation,
-                "orbit_direction": orbit_direction,  # ✅ 现在能正确获取了
+                "orbit_direction": orbit_direction,
                 "relative_orbit": relative_orbit,
                 "processing_level": processing_level,
-                "_attr_dict": attr_dict,  # 调试用，可保留
             }
         )
 
     def _parse_footprint(self, geometry_json: dict) -> Polygon:
         """从 CDSE 返回的 Geometry 字段解析足迹多边形"""
-        if geometry_json.get("type") == "Polygon":
-            coordinates = geometry_json.get("coordinates", [])
-            if coordinates and len(coordinates) > 0:
-                ring = [(lon, lat) for lon, lat in coordinates[0]]
-                return Polygon(ring)
-        # 无法解析则返回默认 AOI 矩形
-        xmin, ymin, xmax, ymax = self.AOI_BOUNDS
+        try:
+            if geometry_json.get("type") == "Polygon":
+                coordinates = geometry_json.get("coordinates", [])
+                if coordinates and len(coordinates) > 0:
+                    ring = [(lon, lat) for lon, lat in coordinates[0]]
+                    return Polygon(ring)
+        except Exception as e:
+            logger.debug(f"解析 Sentinel-1 足迹 Geometry 失败: {e}")
+
+        xmin, ymin, xmax, ymax = self.DEFAULT_AOI_BOUNDS
         return box(xmin, ymin, xmax, ymax)
 
-    def _filter_and_deduplicate(self, products: List[SatelliteProduct]) -> List[SatelliteProduct]:
-        """本地足迹精确相交过滤 + 按 product_id 去重"""
-        aoi_polygon = box(*self.AOI_BOUNDS)
+    def _filter_and_deduplicate(self, products: List[SatelliteProduct], request: SearchRequest) -> List[SatelliteProduct]:
+        """本地足迹精确相交过滤 + 去重"""
+        bounds = self._get_request_bounds(request)
+        aoi_polygon = box(*bounds)
         seen = set()
         filtered = []
         for product in products:

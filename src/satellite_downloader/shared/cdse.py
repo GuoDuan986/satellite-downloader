@@ -4,18 +4,21 @@ from __future__ import annotations
 import hashlib
 import os
 import time
+import logging
 from pathlib import Path
-from typing import Optional, Tuple
+from typing import Optional, Tuple, Callable
 
 import requests
 from requests.adapters import HTTPAdapter
 from urllib3.util.retry import Retry
 
+logger = logging.getLogger(__name__)
+
 
 class CDSEClient:
     """
     Copernicus Data Space Ecosystem (CDSE) 公共客户端。
-    从 CopernicusSentinel2Provider 提取的通用能力：
+    包含：
     - OAuth2 认证和令牌刷新
     - HTTP Session、重试、超时
     - Range 断点续传
@@ -32,10 +35,10 @@ class CDSEClient:
     )
 
     def __init__(
-        self,
-        username: str,
-        password: str,
-        timeout: Tuple[int, int] = (15, 90),
+            self,
+            username: str,
+            password: str,
+            timeout: Tuple[int, int] = (15, 90),
     ):
         self.username = username
         self.password = password
@@ -112,44 +115,31 @@ class CDSEClient:
         return self.session.get(url, params=params, timeout=self.timeout)
 
     def download(
-        self,
-        url: str,
-        local_path: Path,
-        expected_md5: Optional[str] = None,
-        progress_callback: Optional[callable] = None,
-        cancel_check: Optional[callable] = None,
+            self,
+            url: str,
+            local_path: Path,
+            expected_md5: Optional[str] = None,
+            progress_callback: Optional[Callable[[int, int], None]] = None,
+            cancel_check: Optional[Callable[[], bool]] = None,
     ) -> Path:
         """
         断点续传下载文件。
-
-        Args:
-            url: 下载 URL
-            local_path: 目标文件路径（父目录会自动创建）
-            expected_md5: 期望的 MD5 校验值（可选）
-            progress_callback: 进度回调函数，接收 (已下载字节, 总字节)
-            cancel_check: 取消检查函数，返回 True 表示取消
-
-        Returns:
-            下载完成后的文件路径
-
-        Raises:
-            ValueError: MD5 校验失败
-            RuntimeError: 下载被取消或下载不完整
-            requests.RequestException: 网络请求失败
         """
         local_path.parent.mkdir(parents=True, exist_ok=True)
         part_path = local_path.with_suffix(local_path.suffix + ".part")
 
-        # 检查是否已完全下载
+        # 1. 检查目标文件是否已存在且完整
         if local_path.is_file():
             if expected_md5 and _matches_md5(local_path, expected_md5):
                 if progress_callback:
                     progress_callback(local_path.stat().st_size, local_path.stat().st_size)
                 return local_path
-            # 文件存在但校验失败，删除后重新下载
+            elif not expected_md5:
+                # 若无 MD5 且本地文件已存在，默认完成
+                return local_path
             local_path.unlink()
 
-        # 检查 .part 文件是否完整
+        # 2. 检查 .part 文件是否已完整
         if part_path.is_file():
             if expected_md5 and _matches_md5(part_path, expected_md5):
                 os.replace(part_path, local_path)
@@ -157,50 +147,63 @@ class CDSEClient:
                     progress_callback(local_path.stat().st_size, local_path.stat().st_size)
                 return local_path
 
-        # 获取响应（支持断点续传）
-        response, existing_size = self._open_download(url, part_path)
+        # 3. 开始/续传下载逻辑（具备网络波动重试自愈能力）
+        max_retries = 3
+        for attempt in range(max_retries):
+            try:
+                response, existing_size = self._open_download(url, part_path)
+                total_size = _response_total(response, existing_size)
+                downloaded = existing_size
 
-        total_size = _response_total(response, existing_size)
-        downloaded = existing_size
+                if progress_callback:
+                    progress_callback(downloaded, total_size)
 
-        if progress_callback:
-            progress_callback(downloaded, total_size)
+                mode = "ab" if response.status_code == 206 and existing_size else "wb"
+                if mode == "wb":
+                    downloaded = 0
 
-        mode = "ab" if response.status_code == 206 and existing_size else "wb"
-        try:
-            with part_path.open(mode) as output:
-                for chunk in response.iter_content(chunk_size=256 * 1024):
-                    if cancel_check and cancel_check():
-                        response.close()
-                        raise RuntimeError("下载已取消，可稍后从断点继续")
-                    if not chunk:
-                        continue
-                    output.write(chunk)
-                    downloaded += len(chunk)
-                    if progress_callback:
-                        progress_callback(downloaded, total_size)
-        except OSError as exc:
-            response.close()
-            raise RuntimeError(f"写入文件失败：{exc}") from exc
-        finally:
-            response.close()
+                with part_path.open(mode) as output:
+                    for chunk in response.iter_content(chunk_size=256 * 1024):
+                        if cancel_check and cancel_check():
+                            response.close()
+                            raise RuntimeError("下载已取消，可稍后从断点继续")
+                        if not chunk:
+                            continue
+                        output.write(chunk)
+                        downloaded += len(chunk)
+                        if progress_callback:
+                            progress_callback(downloaded, total_size)
 
-        if total_size and downloaded != total_size:
-            raise RuntimeError(f"下载不完整：应为 {total_size} 字节，实际为 {downloaded} 字节")
+                response.close()
 
-        if expected_md5 and not _matches_md5(part_path, expected_md5):
-            raise ValueError("MD5 校验失败，保留 .part 文件以便重新下载")
+                if total_size and downloaded != total_size:
+                    raise RuntimeError(f"下载不完整：应为 {total_size} 字节，实际为 {downloaded} 字节")
 
-        os.replace(part_path, local_path)
+                # 下载完成，校验 MD5
+                if expected_md5 and not _matches_md5(part_path, expected_md5):
+                    raise ValueError("MD5 校验失败，保留 .part 文件以便重新下载")
+
+                os.replace(part_path, local_path)
+                return local_path
+
+            except (requests.RequestException, RuntimeError, OSError) as exc:
+                if cancel_check and cancel_check():
+                    raise RuntimeError("下载已取消") from exc
+                if attempt == max_retries - 1:
+                    raise
+                logger.warning(
+                    f"下载发生网络波动 ({exc})，将在 2 秒后自动续传重试 (第 {attempt + 1}/{max_retries} 次)...")
+                time.sleep(2)
+
         return local_path
 
     def _open_download(self, url: str, part_path: Path) -> Tuple[requests.Response, int]:
-        """打开下载连接，支持断点续传"""
+        """打开下载连接，支持断点续传及 416 容错"""
         existing = part_path.stat().st_size if part_path.exists() else 0
         self._ensure_valid_token()
 
         headers = {"Authorization": f"Bearer {self._access_token}"}
-        if existing:
+        if existing > 0:
             headers["Range"] = f"bytes={existing}-"
 
         for attempt in range(8):
@@ -227,9 +230,15 @@ class CDSEClient:
             raise RuntimeError("下载服务重定向次数过多")
 
         if response.status_code == 401:
-            # Token 可能已过期，刷新后重试
             response.close()
             self._authenticate()
+            return self._open_download(url, part_path)
+
+        # ✅ 处理 416 Range Not Satisfiable (断点位置超出文件大小/文件已在服务器端改变)
+        if response.status_code == 416:
+            response.close()
+            if part_path.exists():
+                part_path.unlink()  # 删除旧断点，重新全量下载
             return self._open_download(url, part_path)
 
         if response.status_code not in (200, 206):
@@ -240,18 +249,14 @@ class CDSEClient:
         return response, existing
 
     def download_product(
-        self,
-        product_id: str,
-        destination: Path,
-        expected_md5: Optional[str] = None,
-        progress_callback: Optional[callable] = None,
-        cancel_check: Optional[callable] = None,
+            self,
+            product_id: str,
+            destination: Path,
+            expected_md5: Optional[str] = None,
+            progress_callback: Optional[Callable[[int, int], None]] = None,
+            cancel_check: Optional[Callable[[], bool]] = None,
     ) -> Path:
-        """
-        按产品 ID 下载整包产品。
-
-        这是 download() 的便捷包装，自动构造下载 URL。
-        """
+        """按产品 ID 下载整包产品"""
         url = self.DOWNLOAD_URL_TEMPLATE.format(product_id=product_id)
         return self.download(url, destination, expected_md5, progress_callback, cancel_check)
 
